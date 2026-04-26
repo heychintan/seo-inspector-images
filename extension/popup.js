@@ -796,8 +796,15 @@ document.addEventListener('click', async e => {
   const img = state.data?.images?.[i];
   if (!img) return;
   if (act === 'img-copy') {
-    try { await navigator.clipboard.writeText(img.src); flashSuccess(btn, 'Copied'); }
-    catch { flash(btn, 'Failed'); }
+    flash(btn, 'Copying…');
+    try {
+      await copyImageBitmap(img.src);
+      flashSuccess(btn, 'Copied image');
+    } catch (e) {
+      // fall back to copying the URL so the click never feels useless
+      try { await navigator.clipboard.writeText(img.src); flashSuccess(btn, 'Copied URL'); }
+      catch { flash(btn, 'Failed'); }
+    }
   } else if (act === 'img-open') {
     chrome.tabs.create({ url: img.src });
   } else if (act === 'img-dl') {
@@ -825,6 +832,56 @@ function safeFilename(n) {
   return String(n || 'file').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 180) || 'file';
 }
 
+// Copy an image to the system clipboard as a real bitmap (so it can be pasted
+// into Figma, Slack, mail clients, etc — not just as a URL string).
+//
+// Strategy:
+//   1. Fetch the bytes (extension has <all_urls> host permission, so cross-
+//      origin works without CORS gymnastics).
+//   2. If it's already PNG, write it directly via ClipboardItem.
+//   3. Otherwise (JPG/WebP/AVIF/SVG/data:), decode → draw to a canvas →
+//      re-encode as PNG. Most OSes only accept image/png on the clipboard.
+async function copyImageBitmap(src) {
+  const resp = await fetch(src, { credentials: 'omit', referrerPolicy: 'no-referrer' });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const blob = await resp.blob();
+
+  if (blob.type === 'image/png') {
+    return navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+  }
+
+  // Decode → re-encode as PNG via OffscreenCanvas (or HTMLCanvas fallback).
+  const objUrl = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload  = () => resolve(i);
+      i.onerror = () => reject(new Error('Image decode failed'));
+      i.crossOrigin = 'anonymous';
+      i.src = objUrl;
+    });
+    const w = img.naturalWidth  || img.width  || 1;
+    const h = img.naturalHeight || img.height || 1;
+
+    let pngBlob;
+    if (typeof OffscreenCanvas !== 'undefined') {
+      const canvas = new OffscreenCanvas(w, h);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      pngBlob = await canvas.convertToBlob({ type: 'image/png' });
+    } else {
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      pngBlob = await new Promise(res => canvas.toBlob(res, 'image/png'));
+      if (!pngBlob) throw new Error('Canvas encode failed');
+    }
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
+  } finally {
+    URL.revokeObjectURL(objUrl);
+  }
+}
+
 function guessFilename(url) {
   try {
     const u = new URL(url);
@@ -833,10 +890,10 @@ function guessFilename(url) {
 }
 
 function flash(el, msg) {
-  const original = el.getAttribute('title');
   el.setAttribute('title', msg);
+  el.setAttribute('aria-label', msg);
   el.style.transform = 'scale(0.92)';
-  setTimeout(() => { el.style.transform = ''; el.setAttribute('title', original || ''); }, 600);
+  setTimeout(() => { el.style.transform = ''; }, 600);
 }
 
 function showError(msg) {
