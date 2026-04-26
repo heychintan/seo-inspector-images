@@ -219,16 +219,14 @@ const ICONS = {
 };
 
 function fieldRow(icon, label, valueHTML, badgeHTML = '', copyText = null) {
-  const right = `
-    <div class="row-actions">
-      ${badgeHTML || ''}
-      ${copyText != null && copyText !== '' ? copyBtn(copyText, `Copy ${label.toLowerCase()}`) : ''}
-    </div>`;
+  const inlineCopy = (copyText != null && copyText !== '')
+    ? copyBtn(copyText, `Copy ${label.toLowerCase()}`, 'inline')
+    : '';
   return `
     <div class="field">
       <div class="label"><span class="ico">${icon}</span>${escapeHtml(label)}</div>
-      ${right}
-      <div class="value ${valueHTML ? '' : 'muted'}">${valueHTML || 'Not set'}</div>
+      <div class="row-actions">${badgeHTML || ''}</div>
+      <div class="value ${valueHTML ? '' : 'muted'}">${valueHTML || 'Not set'}${inlineCopy}</div>
     </div>`;
 }
 
@@ -251,11 +249,15 @@ function openBtn(url, ariaLabel = 'Open in new tab', cls = '') {
   return `<button type="button" class="mini ${cls}" data-act="open-url" data-url="${escapeHtml(url)}" aria-label="${escapeHtml(ariaLabel)}" title="${escapeHtml(ariaLabel)}">${ICONS.open}<span class="sr-only">${escapeHtml(ariaLabel)}</span></button>`;
 }
 
-function lengthBadge(len, ok, soft, msg) {
-  if (len === 0) return `<span class="badge warn">${ICONS.warn} Missing</span>`;
-  if (len <= ok) return `<span class="badge ok">${ICONS.check} ${len} chars</span>`;
-  if (len <= soft) return `<span class="badge info">${len} chars</span>`;
-  return `<span class="badge warn">${ICONS.warn} ${len} chars · ${msg}</span>`;
+// SEO length thresholds based on Google SERP rendering:
+//   title       — sweet spot 30–60 chars (warn under 30, warn over 60)
+//   description — sweet spot 70–160 chars (warn under 70, warn over 160)
+function lengthBadge(len, { min, max, soft }) {
+  if (len === 0)    return `<span class="badge warn">${ICONS.warn} Missing</span>`;
+  if (len < min)    return `<span class="badge warn">${ICONS.warn} ${len} chars · too short</span>`;
+  if (len <= max)   return `<span class="badge ok">${ICONS.check} ${len} chars</span>`;
+  if (len <= soft)  return `<span class="badge info">${len} chars · long</span>`;
+  return `<span class="badge warn">${ICONS.warn} ${len} chars · too long</span>`;
 }
 
 // =============================================================
@@ -269,8 +271,8 @@ function renderOverview() {
 
   $('#tab-overview').innerHTML = `
     <div class="fields">
-      ${fieldRow(ICONS.title, 'Title', escapeHtml(d.title), lengthBadge(titleLen, 60, 70, 'too long'), d.title)}
-      ${fieldRow(ICONS.desc,  'Description', escapeHtml(d.description), lengthBadge(descLen, 160, 175, 'too long'), d.description)}
+      ${fieldRow(ICONS.title, 'Title',       escapeHtml(d.title),       lengthBadge(titleLen, { min: 30, max: 60,  soft: 70  }), d.title)}
+      ${fieldRow(ICONS.desc,  'Description', escapeHtml(d.description), lengthBadge(descLen,  { min: 70, max: 160, soft: 175 }), d.description)}
       ${fieldRow(ICONS.link,  'URL', escapeHtml(d.url), '', d.url)}
       ${fieldRow(ICONS.canon, 'Canonical',
         d.canonical
@@ -318,10 +320,11 @@ function renderHeadings() {
     d.headings.forEach(h => {
       const indent = Math.max(0, h.level - 1);
       const empty = !h.text;
+      const inlineCopy = empty ? '' : copyBtn(h.text, `Copy H${h.level} text`, 'inline');
       rows += `<div class="heading lvl-${h.level} ${empty ? 'empty' : ''}" data-indent="${indent}">
         <span class="tag">H${h.level}</span>
-        <span class="text">${empty ? 'Empty heading' : escapeHtml(h.text)}</span>
-        ${empty ? '<span></span>' : copyBtn(h.text, `Copy H${h.level} text`)}
+        <span class="text">${empty ? 'Empty heading' : escapeHtml(h.text)}${inlineCopy}</span>
+        <span></span>
       </div>`;
     });
     rows += `</div>`;
@@ -365,8 +368,7 @@ function renderLinks() {
         <div class="linkrow">
           <span class="anchor ${l.anchor ? '' : 'empty'}">${l.anchor ? escapeHtml(l.anchor) : 'No anchor text'}</span>
           <span class="meta-tags">${tags.join('')}</span>
-          <span class="row-actions">${copyBtn(l.url, 'Copy link URL')}${openBtn(l.url, 'Open link')}</span>
-          <span class="url"><a href="${escapeHtml(l.url)}" target="_blank" rel="noopener">${escapeHtml(l.url)}</a></span>
+          <span class="url"><a href="${escapeHtml(l.url)}" target="_blank" rel="noopener">${escapeHtml(l.url)}</a>${copyBtn(l.url, 'Copy link URL', 'inline')}${openBtn(l.url, 'Open link', 'inline')}</span>
         </div>`;
     });
     body += `</div>`;
@@ -692,12 +694,16 @@ function renderSocial() {
       const v = obj[k];
       const isUrl = /^https?:\/\//i.test(v);
       const isImg = /image$/i.test(k) && isUrl;
-      html += `<div class="field" style="grid-template-columns:1fr auto;padding-top:8px;padding-bottom:8px">
+      const valueText = isUrl
+        ? `<a href="${escapeHtml(v)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">${escapeHtml(v)}</a>`
+        : escapeHtml(v);
+      const inlineCopy = copyBtn(v, `Copy ${k}`, 'inline');
+      const dlAction   = isImg ? dlBtn(v, k.replace(/[:]/g, '_') + '.img', `Download ${k}`, 'inline') : '';
+      html += `<div class="field" style="grid-template-columns:1fr;padding-top:8px;padding-bottom:8px">
         <div class="label" style="font-weight:500;font-size:12px;color:var(--muted);font-family:'JetBrains Mono',monospace">${escapeHtml(k)}</div>
-        <div class="row-actions">${copyBtn(v, `Copy ${k}`)}${isImg ? dlBtn(v, k.replace(/[:]/g, '_') + '.img', `Download ${k}`) : ''}</div>
-        <div class="value prose" style="grid-column:1 / -1;display:flex;gap:10px;align-items:flex-start">
+        <div class="value prose" style="grid-column:1;display:flex;gap:10px;align-items:flex-start">
           ${isImg ? `<img src="${escapeHtml(v)}" alt="" referrerpolicy="no-referrer" loading="lazy" style="width:64px;height:48px;object-fit:cover;border-radius:6px;border:1px solid var(--line);flex-shrink:0">` : ''}
-          <span style="min-width:0;flex:1;word-break:break-word">${isUrl ? `<a href="${escapeHtml(v)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">${escapeHtml(v)}</a>` : escapeHtml(v)}</span>
+          <span style="min-width:0;flex:1;word-break:break-word">${valueText}${inlineCopy}${dlAction}</span>
         </div>
       </div>`;
     });

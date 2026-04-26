@@ -93,9 +93,10 @@ body {
   font-family: 'Instrument Serif', serif;
   font-style: italic;
   font-weight: 400;
-  font-size: 17px;
+  font-size: 18px;
   letter-spacing: 0.04em;
-  color: var(--nav-ink);
+  /* lighter, more saturated tint than the body --accent so it pops on dark nav */
+  color: oklch(78% 0.18 285);
   line-height: 1;
 }
 .nav-sep {
@@ -716,6 +717,16 @@ body {
 }
 .mini.ok { color: var(--ok); border-color: oklch(85% 0.06 155); background: oklch(97% 0.04 155); }
 
+/* inline copy that sits at the end of a text value (flows with line wrap) */
+.mini.inline {
+  width: 22px;
+  height: 22px;
+  vertical-align: -5px;     /* visually anchor to baseline of surrounding text */
+  margin-left: 4px;
+  display: inline-flex;
+}
+.mini.inline svg { width: 11px; height: 11px; }
+
 /* row-hover affordance: hide miniaction by default in fields/headings/links/schema */
 .field .mini, .heading .mini, .linkrow .mini, .schema .doc-head .mini, .field .row-actions .mini {
   opacity: 0;
@@ -736,12 +747,22 @@ body {
   grid-template-columns: 44px 1fr auto;
 }
 
-/* link row tweak: anchor row now reserves an action column */
-.linkrow {
-  grid-template-columns: 1fr auto auto;
+/* link row: URL line uses flex so inline copy/open sit at the end of the
+   ellipsised anchor without getting clipped */
+.linkrow .url {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+.linkrow .url a {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 0 1 auto;
 }
 .linkrow .meta-tags { align-self: center; }
-.linkrow .row-actions { display: inline-flex; gap: 2px; align-self: center; }
 
 /* field row action stack (top-right of value) */
 .field .row-actions {
