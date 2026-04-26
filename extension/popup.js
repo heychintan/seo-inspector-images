@@ -218,13 +218,37 @@ const ICONS = {
   download: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>`,
 };
 
-function fieldRow(icon, label, valueHTML, badgeHTML = '') {
+function fieldRow(icon, label, valueHTML, badgeHTML = '', copyText = null) {
+  const right = `
+    <div class="row-actions">
+      ${badgeHTML || ''}
+      ${copyText != null && copyText !== '' ? copyBtn(copyText, `Copy ${label.toLowerCase()}`) : ''}
+    </div>`;
   return `
     <div class="field">
       <div class="label"><span class="ico">${icon}</span>${escapeHtml(label)}</div>
-      ${badgeHTML ? badgeHTML : '<span></span>'}
+      ${right}
       <div class="value ${valueHTML ? '' : 'muted'}">${valueHTML || 'Not set'}</div>
     </div>`;
+}
+
+// ---------- mini-button helpers ----------
+function copyBtn(text, ariaLabel = 'Copy', cls = '') {
+  // store payload via data-copy attribute (escape carefully)
+  const payload = String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  return `<button type="button" class="mini ${cls}" data-act="copy-text" data-copy="${payload}" aria-label="${escapeHtml(ariaLabel)}" title="${escapeHtml(ariaLabel)}">${ICONS.copy}<span class="sr-only">${escapeHtml(ariaLabel)}</span></button>`;
+}
+
+function dlBtn(url, filename, ariaLabel = 'Download', cls = '') {
+  return `<button type="button" class="mini ${cls}" data-act="dl-url" data-url="${escapeHtml(url)}" data-filename="${escapeHtml(filename || '')}" aria-label="${escapeHtml(ariaLabel)}" title="${escapeHtml(ariaLabel)}">${ICONS.download}<span class="sr-only">${escapeHtml(ariaLabel)}</span></button>`;
+}
+
+function openBtn(url, ariaLabel = 'Open in new tab', cls = '') {
+  return `<button type="button" class="mini ${cls}" data-act="open-url" data-url="${escapeHtml(url)}" aria-label="${escapeHtml(ariaLabel)}" title="${escapeHtml(ariaLabel)}">${ICONS.open}<span class="sr-only">${escapeHtml(ariaLabel)}</span></button>`;
 }
 
 function lengthBadge(len, ok, soft, msg) {
@@ -245,22 +269,25 @@ function renderOverview() {
 
   $('#tab-overview').innerHTML = `
     <div class="fields">
-      ${fieldRow(ICONS.title, 'Title', escapeHtml(d.title), lengthBadge(titleLen, 60, 70, 'too long'))}
-      ${fieldRow(ICONS.desc,  'Description', escapeHtml(d.description), lengthBadge(descLen, 160, 175, 'too long'))}
-      ${fieldRow(ICONS.link,  'URL', escapeHtml(d.url))}
+      ${fieldRow(ICONS.title, 'Title', escapeHtml(d.title), lengthBadge(titleLen, 60, 70, 'too long'), d.title)}
+      ${fieldRow(ICONS.desc,  'Description', escapeHtml(d.description), lengthBadge(descLen, 160, 175, 'too long'), d.description)}
+      ${fieldRow(ICONS.link,  'URL', escapeHtml(d.url), '', d.url)}
       ${fieldRow(ICONS.canon, 'Canonical',
         d.canonical
           ? `<a href="${escapeHtml(d.canonical)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">${escapeHtml(d.canonical)}</a>`
           : '',
         canonOk
           ? `<span class="badge ok">${ICONS.check} Self-referencing</span>`
-          : (d.canonical ? `<span class="badge info">External</span>` : `<span class="badge muted">None</span>`)
+          : (d.canonical ? `<span class="badge info">External</span>` : `<span class="badge muted">None</span>`),
+        d.canonical
       )}
       ${fieldRow(ICONS.robot, 'Robots', escapeHtml(d.robots) || '<span class="muted">Default (index, follow)</span>',
-        /noindex/i.test(d.robots) ? `<span class="badge warn">${ICONS.warn} noindex</span>` : ''
+        /noindex/i.test(d.robots) ? `<span class="badge warn">${ICONS.warn} noindex</span>` : '',
+        d.robots
       )}
       ${fieldRow(ICONS.globe, 'Language', escapeHtml(d.lang) || '',
-        d.lang ? `<span class="badge muted">${escapeHtml(d.lang)}</span>` : `<span class="badge warn">${ICONS.warn} No lang attr</span>`
+        d.lang ? `<span class="badge muted">${escapeHtml(d.lang)}</span>` : `<span class="badge warn">${ICONS.warn} No lang attr</span>`,
+        d.lang
       )}
     </div>`;
 }
@@ -294,7 +321,7 @@ function renderHeadings() {
       rows += `<div class="heading lvl-${h.level} ${empty ? 'empty' : ''}" data-indent="${indent}">
         <span class="tag">H${h.level}</span>
         <span class="text">${empty ? 'Empty heading' : escapeHtml(h.text)}</span>
-        <span></span>
+        ${empty ? '<span></span>' : copyBtn(h.text, `Copy H${h.level} text`)}
       </div>`;
     });
     rows += `</div>`;
@@ -338,6 +365,7 @@ function renderLinks() {
         <div class="linkrow">
           <span class="anchor ${l.anchor ? '' : 'empty'}">${l.anchor ? escapeHtml(l.anchor) : 'No anchor text'}</span>
           <span class="meta-tags">${tags.join('')}</span>
+          <span class="row-actions">${copyBtn(l.url, 'Copy link URL')}${openBtn(l.url, 'Open link')}</span>
           <span class="url"><a href="${escapeHtml(l.url)}" target="_blank" rel="noopener">${escapeHtml(l.url)}</a></span>
         </div>`;
     });
@@ -619,8 +647,15 @@ function renderSchema() {
   let body = `<div class="schema">`;
   flat.forEach(({ item, src }) => {
     const type = item?.['@type'] || 'Untyped';
+    const json = JSON.stringify(item, null, 2);
     body += `<div class="doc">
-      <div class="doc-head"><span class="type">${escapeHtml(Array.isArray(type) ? type.join(' · ') : String(type))}</span><span class="src">${escapeHtml(src)}</span></div>
+      <div class="doc-head">
+        <span class="type">${escapeHtml(Array.isArray(type) ? type.join(' · ') : String(type))}</span>
+        <span style="display:inline-flex;gap:8px;align-items:center">
+          <span class="src">${escapeHtml(src)}</span>
+          ${copyBtn(json, 'Copy JSON', 'always')}
+        </span>
+      </div>
       ${renderKV(item)}
     </div>`;
   });
@@ -657,9 +692,10 @@ function renderSocial() {
       const v = obj[k];
       const isUrl = /^https?:\/\//i.test(v);
       const isImg = /image$/i.test(k) && isUrl;
-      html += `<div class="field" style="grid-template-columns:1fr;padding-top:8px;padding-bottom:8px">
+      html += `<div class="field" style="grid-template-columns:1fr auto;padding-top:8px;padding-bottom:8px">
         <div class="label" style="font-weight:500;font-size:12px;color:var(--muted);font-family:'JetBrains Mono',monospace">${escapeHtml(k)}</div>
-        <div class="value prose" style="grid-column:1;display:flex;gap:10px;align-items:flex-start">
+        <div class="row-actions">${copyBtn(v, `Copy ${k}`)}${isImg ? dlBtn(v, k.replace(/[:]/g, '_') + '.img', `Download ${k}`) : ''}</div>
+        <div class="value prose" style="grid-column:1 / -1;display:flex;gap:10px;align-items:flex-start">
           ${isImg ? `<img src="${escapeHtml(v)}" alt="" referrerpolicy="no-referrer" loading="lazy" style="width:64px;height:48px;object-fit:cover;border-radius:6px;border:1px solid var(--line);flex-shrink:0">` : ''}
           <span style="min-width:0;flex:1;word-break:break-word">${isUrl ? `<a href="${escapeHtml(v)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">${escapeHtml(v)}</a>` : escapeHtml(v)}</span>
         </div>
@@ -685,23 +721,32 @@ function renderAdvanced() {
     hreflang = `<div class="value prose">${d.hreflang.map(h => `<div><b style="color:var(--ink);font-weight:600">${escapeHtml(h.lang)}</b> → <a href="${escapeHtml(h.href)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">${escapeHtml(h.href)}</a></div>`).join('')}</div>`;
   }
 
+  const robotsUrl  = originOf(d.url) + '/robots.txt';
+  const sitemapUrl = originOf(d.url) + '/sitemap.xml';
+
   $('#tab-advanced').innerHTML = `
     <div class="fields">
-      ${fieldRow(ICONS.globe, 'Viewport', escapeHtml(d.viewport), d.viewport ? '' : `<span class="badge warn">${ICONS.warn} Missing</span>`)}
-      ${fieldRow(ICONS.globe, 'Charset', escapeHtml(d.charset))}
-      ${fieldRow(ICONS.globe, 'Favicon', d.favicon ? `<a href="${escapeHtml(d.favicon)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">${escapeHtml(d.favicon)}</a>` : '', d.favicon ? '' : `<span class="badge warn">${ICONS.warn} Missing</span>`)}
+      ${fieldRow(ICONS.globe, 'Viewport', escapeHtml(d.viewport), d.viewport ? '' : `<span class="badge warn">${ICONS.warn} Missing</span>`, d.viewport)}
+      ${fieldRow(ICONS.globe, 'Charset',  escapeHtml(d.charset), '', d.charset)}
+      ${fieldRow(ICONS.globe, 'Favicon',
+        d.favicon ? `<a href="${escapeHtml(d.favicon)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">${escapeHtml(d.favicon)}</a>` : '',
+        d.favicon ? '' : `<span class="badge warn">${ICONS.warn} Missing</span>`,
+        d.favicon
+      )}
       <div class="field">
         <div class="label"><span class="ico">${ICONS.globe}</span>Hreflang</div>
-        <span class="badge ${d.hreflang.length ? 'info' : 'muted'}">${d.hreflang.length || 'None'}</span>
+        <div class="row-actions"><span class="badge ${d.hreflang.length ? 'info' : 'muted'}">${d.hreflang.length || 'None'}</span></div>
         ${hreflang || '<div class="value muted">No hreflang alternates.</div>'}
       </div>
       <div class="field">
         <div class="label"><span class="ico">${ICONS.link}</span>Robots.txt</div>
-        <a href="${escapeHtml(originOf(d.url))}/robots.txt" target="_blank" rel="noopener" class="copychip" style="background:var(--accent-2);color:var(--accent);padding:5px 10px;border-radius:8px;font-weight:600">${ICONS.open} Open</a>
+        <div class="row-actions">${openBtn(robotsUrl, 'Open robots.txt', 'always')}${dlBtn(robotsUrl, 'robots.txt', 'Download robots.txt', 'always')}</div>
+        <div class="value">${escapeHtml(robotsUrl)}</div>
       </div>
       <div class="field">
         <div class="label"><span class="ico">${ICONS.link}</span>Sitemap.xml</div>
-        <a href="${escapeHtml(originOf(d.url))}/sitemap.xml" target="_blank" rel="noopener" class="copychip" style="background:var(--accent-2);color:var(--accent);padding:5px 10px;border-radius:8px;font-weight:600">${ICONS.open} Open</a>
+        <div class="row-actions">${openBtn(sitemapUrl, 'Open sitemap.xml', 'always')}${dlBtn(sitemapUrl, 'sitemap.xml', 'Download sitemap.xml', 'always')}</div>
+        <div class="value">${escapeHtml(sitemapUrl)}</div>
       </div>
     </div>`;
 }
@@ -717,19 +762,69 @@ document.addEventListener('click', async e => {
   const btn = e.target.closest('[data-act]');
   if (!btn) return;
   const act = btn.dataset.act;
+
+  // generic copy
+  if (act === 'copy-text') {
+    const text = btn.dataset.copy ?? '';
+    try { await navigator.clipboard.writeText(text); flashSuccess(btn, 'Copied'); }
+    catch { flash(btn, 'Failed'); }
+    return;
+  }
+  // generic download by URL
+  if (act === 'dl-url') {
+    const url = btn.dataset.url;
+    const filename = btn.dataset.filename || guessFilename(url);
+    if (url) chrome.downloads.download({ url, filename: safeFilename(filename), saveAs: false }).catch(() => {});
+    flashSuccess(btn, 'Downloading');
+    return;
+  }
+  // generic open in tab
+  if (act === 'open-url') {
+    const url = btn.dataset.url;
+    if (url) chrome.tabs.create({ url });
+    return;
+  }
+
+  // image-row actions
   const i = Number(btn.dataset.i);
   const img = state.data?.images?.[i];
   if (!img) return;
-
   if (act === 'img-copy') {
-    try { await navigator.clipboard.writeText(img.src); flash(btn, 'Copied'); }
+    try { await navigator.clipboard.writeText(img.src); flashSuccess(btn, 'Copied'); }
     catch { flash(btn, 'Failed'); }
   } else if (act === 'img-open') {
     chrome.tabs.create({ url: img.src });
   } else if (act === 'img-dl') {
     downloadImg(img);
+    flashSuccess(btn, 'Downloading');
   }
 });
+
+function flashSuccess(el, msg) {
+  const originalTitle = el.getAttribute('title') || el.getAttribute('aria-label') || '';
+  const originalHTML  = el.innerHTML;
+  el.classList.add('ok');
+  el.innerHTML = `${ICONS.check}<span class="sr-only">${escapeHtml(msg)}</span>`;
+  el.setAttribute('title', msg);
+  el.setAttribute('aria-label', msg);
+  setTimeout(() => {
+    el.classList.remove('ok');
+    el.innerHTML = originalHTML;
+    el.setAttribute('title', originalTitle);
+    el.setAttribute('aria-label', originalTitle);
+  }, 1100);
+}
+
+function safeFilename(n) {
+  return String(n || 'file').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 180) || 'file';
+}
+
+function guessFilename(url) {
+  try {
+    const u = new URL(url);
+    return decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || u.hostname);
+  } catch { return 'file'; }
+}
 
 function flash(el, msg) {
   const original = el.getAttribute('title');

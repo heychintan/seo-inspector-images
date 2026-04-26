@@ -515,7 +515,6 @@ body {
   text-align: center;
   text-transform: uppercase;
 }
-.heading.lvl-1 .tag, .heading.lvl-2 .tag { background: var(--ink); color: var(--surface); }
 .heading .text {
   font-size: 13px;
   color: var(--ink);
@@ -650,22 +649,81 @@ body {
   margin-bottom: 4px;
 }
 
-/* ---------- copy chip ---------- */
-.copychip {
+/* ---------- mini icon button (copy / download / open) ---------- */
+.mini {
   appearance: none;
   background: transparent;
-  border: 0;
+  border: 1px solid transparent;
   color: var(--muted);
   cursor: pointer;
-  padding: 4px;
-  border-radius: 6px;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  font: inherit;
-  font-size: 11px;
-  transition: color .15s, background .15s;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 0;
+  transition: color .15s, background .15s, border-color .15s, transform .08s;
 }
-.copychip:hover { color: var(--ink); background: oklch(96% 0.008 270); }
-.copychip svg { width: 12px; height: 12px; }
+.mini svg { width: 13px; height: 13px; }
+.mini:hover {
+  color: var(--ink);
+  background: var(--surface);
+  border-color: var(--line);
+}
+.mini:active { transform: translateY(1px); }
+.mini:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.mini.ok { color: var(--ok); border-color: oklch(85% 0.06 155); background: oklch(97% 0.04 155); }
+
+/* row-hover affordance: hide miniaction by default in fields/headings/links/schema */
+.field .mini, .heading .mini, .linkrow .mini, .schema .doc-head .mini, .field .row-actions .mini {
+  opacity: 0;
+  transform: translateX(2px);
+}
+.field:hover .mini, .field:focus-within .mini,
+.heading:hover .mini, .heading:focus-within .mini,
+.linkrow:hover .mini, .linkrow:focus-within .mini,
+.schema .doc:hover .doc-head .mini, .schema .doc:focus-within .doc-head .mini,
+.field:hover .row-actions .mini, .field:focus-within .row-actions .mini {
+  opacity: 1;
+  transform: translateX(0);
+}
+.mini.always { opacity: 1 !important; transform: none !important; }
+
+/* heading row needs space for the action */
+.heading {
+  grid-template-columns: 44px 1fr auto;
+}
+
+/* link row tweak: anchor row now reserves an action column */
+.linkrow {
+  grid-template-columns: 1fr auto auto;
+}
+.linkrow .meta-tags { align-self: center; }
+.linkrow .row-actions { display: inline-flex; gap: 2px; align-self: center; }
+
+/* field row action stack (top-right of value) */
+.field .row-actions {
+  display: inline-flex;
+  gap: 2px;
+  align-items: center;
+}
+
+/* schema doc head action */
+.schema .doc-head .actions { display: inline-flex; gap: 2px; align-items: center; }
+
+/* a11y-only label */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
