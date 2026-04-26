@@ -101,29 +101,34 @@ function scrapePage() {
     });
   });
 
-  // images (same rules as before but folded in)
-  const seenImg = new Set();
-  const pushImg = (src, alt, w, h) => {
+  // assets (images + videos folded into the same array)
+  const seenAsset = new Set();
+  const pushAsset = (src, alt, w, h, kind, poster) => {
     if (!src) return;
     let abs;
     try { abs = new URL(src, document.baseURI).href; } catch { return; }
-    if (!/^https?:|^data:/i.test(abs)) return;
-    if (seenImg.has(abs)) return;
-    seenImg.add(abs);
-    out.images.push({ src: abs, alt: (alt || '').trim(), w: w || 0, h: h || 0 });
+    if (!/^https?:|^data:|^blob:/i.test(abs)) return;
+    if (seenAsset.has(abs)) return;
+    seenAsset.add(abs);
+    out.images.push({ src: abs, alt: (alt || '').trim(), w: w || 0, h: h || 0, kind, poster: poster || '' });
   };
+
+  // <img>
   document.querySelectorAll('img').forEach(img => {
     const src = img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('data-original');
-    pushImg(src, img.alt, img.naturalWidth || img.width, img.naturalHeight || img.height);
+    pushAsset(src, img.alt, img.naturalWidth || img.width, img.naturalHeight || img.height, 'image');
   });
+  // <picture><source srcset>
   document.querySelectorAll('picture source').forEach(s => {
     const set = s.getAttribute('srcset');
     if (!set) return;
-    set.split(',').forEach(p => pushImg(p.trim().split(/\s+/)[0], '', 0, 0));
+    set.split(',').forEach(p => pushAsset(p.trim().split(/\s+/)[0], '', 0, 0, 'image'));
   });
+  // <svg><image>
   document.querySelectorAll('svg image').forEach(im => {
-    pushImg(im.getAttribute('href') || im.getAttribute('xlink:href'), '', 0, 0);
+    pushAsset(im.getAttribute('href') || im.getAttribute('xlink:href'), '', 0, 0, 'image');
   });
+  // CSS background-image
   let bgScanned = 0;
   for (const el of document.querySelectorAll('*')) {
     if (bgScanned > 600) break;
@@ -132,8 +137,33 @@ function scrapePage() {
     if (!bg || bg === 'none') continue;
     const re = /url\((['"]?)(.*?)\1\)/g;
     let m;
-    while ((m = re.exec(bg)) !== null) pushImg(m[2], '', 0, 0);
+    while ((m = re.exec(bg)) !== null) pushAsset(m[2], '', 0, 0, 'image');
   }
+
+  // <video> + <video><source> (also pull poster as a separate image asset)
+  document.querySelectorAll('video').forEach(v => {
+    const w = v.videoWidth || v.clientWidth || 0;
+    const h = v.videoHeight || v.clientHeight || 0;
+    const direct = v.currentSrc || v.src || v.getAttribute('src');
+    if (direct) {
+      pushAsset(direct, v.getAttribute('aria-label') || '', w, h, 'video', v.poster);
+    }
+    v.querySelectorAll('source').forEach(s => {
+      const src = s.src || s.getAttribute('src');
+      if (src) pushAsset(src, '', w, h, 'video', v.poster);
+    });
+    if (v.poster) pushAsset(v.poster, '', 0, 0, 'image');
+  });
+
+  // <audio> + <audio><source> (rare on SEO pages but cheap to include)
+  document.querySelectorAll('audio').forEach(a => {
+    const direct = a.currentSrc || a.src || a.getAttribute('src');
+    if (direct) pushAsset(direct, '', 0, 0, 'audio');
+    a.querySelectorAll('source').forEach(s => {
+      const src = s.src || s.getAttribute('src');
+      if (src) pushAsset(src, '', 0, 0, 'audio');
+    });
+  });
 
   // JSON-LD schema
   document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
@@ -392,11 +422,11 @@ function renderImages() {
   const imgs = state.data.images;
 
   if (imgs.length === 0) {
-    $('#tab-images').innerHTML = `<div class="empty"><span class="em">No images.</span>This page contains no &lt;img&gt;, picture sources, or CSS background images.</div>`;
+    $('#tab-images').innerHTML = `<div class="empty"><span class="em">No assets.</span>This page contains no images, videos, or CSS background media.</div>`;
     return;
   }
 
-  // ensure each image has type/name/bytes
+  // ensure each asset has type/name/bytes (kind is set during scrape)
   imgs.forEach(i => {
     if (!i.type) {
       const parsed = parseImgUrl(i.src);
@@ -404,6 +434,7 @@ function renderImages() {
       i.type = parsed.type;
       i.bytes = i.bytes || 0;
     }
+    if (!i.kind) i.kind = 'image';
   });
 
   const counts = {};
@@ -417,7 +448,9 @@ function renderImages() {
 
   const visible = state.imgTypes.has('ALL') ? imgs : imgs.filter(i => state.imgTypes.has(i.type));
   const totalBytes = visible.reduce((s, i) => s + (i.bytes || 0), 0);
-  const missing = visible.filter(i => !i.alt).length;
+  // missing-alt only applies to images, not videos/audio
+  const missing = visible.filter(i => i.kind === 'image' && !i.alt).length;
+  const videoCount = visible.filter(i => i.kind === 'video').length;
 
   let body = '';
   if (visible.length === 0) {
@@ -441,13 +474,14 @@ function renderImages() {
   $('#tab-images').innerHTML = `
     <header class="header">
       <div>
-        <h1>Page <em>imagery</em></h1>
+        <h1>Page <em>assets</em></h1>
         <div class="sub">
-          <b>${visible.length}</b> of <b>${imgs.length}</b> images
+          <b>${visible.length}</b> of <b>${imgs.length}</b> assets
+          ${videoCount ? `<span class="sep">·</span><b>${videoCount}</b> video${videoCount === 1 ? '' : 's'}` : ''}
           <span class="sep">·</span>
           <b>${totalBytes ? fmtTotal(totalBytes) : '—'}</b> total
           <span class="sep">·</span>
-          <b style="color: var(--warn)">${missing}</b> missing alt
+          <b style="color: var(--warn)">${missing}</b> img${missing === 1 ? '' : 's'} missing alt
         </div>
       </div>
       <button class="download-all" id="downloadAll" type="button" title="Download all visible images">
@@ -519,8 +553,21 @@ function parseImgUrl(src) {
 
 function imgThumbHTML(img) {
   if (img.broken) {
-    return `<div class="thumb broken" title="Image failed to load">
+    return `<div class="thumb broken" title="Asset failed to load">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11"/><path d="m21 21-6-6"/><path d="m15 21 6-6"/></svg>
+    </div>`;
+  }
+  if (img.kind === 'video') {
+    // Prefer the poster image (no decode cost). Fall back to the video itself
+    // with preload=metadata so the browser pulls just enough to render frame 1.
+    const inner = img.poster
+      ? `<img src="${escapeHtml(img.poster)}" alt="" loading="lazy" referrerpolicy="no-referrer" data-thumb>`
+      : `<video src="${escapeHtml(img.src)}" muted playsinline preload="metadata" referrerpolicy="no-referrer" data-thumb></video>`;
+    return `<div class="thumb media">${inner}<span class="play-badge" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span></div>`;
+  }
+  if (img.kind === 'audio') {
+    return `<div class="thumb media audio" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
     </div>`;
   }
   return `<div class="thumb"><img src="${escapeHtml(img.src)}" alt="" loading="lazy" referrerpolicy="no-referrer" data-thumb></div>`;
@@ -796,14 +843,19 @@ document.addEventListener('click', async e => {
   const img = state.data?.images?.[i];
   if (!img) return;
   if (act === 'img-copy') {
-    flash(btn, 'Copying…');
-    try {
-      await copyImageBitmap(img.src);
-      flashSuccess(btn, 'Copied image');
-    } catch (e) {
-      // fall back to copying the URL so the click never feels useless
+    if (img.kind !== 'image') {
+      // clipboards don't accept video/audio bitmaps — copy the URL instead
       try { await navigator.clipboard.writeText(img.src); flashSuccess(btn, 'Copied URL'); }
       catch { flash(btn, 'Failed'); }
+    } else {
+      flash(btn, 'Copying…');
+      try {
+        await copyImageBitmap(img.src);
+        flashSuccess(btn, 'Copied image');
+      } catch {
+        try { await navigator.clipboard.writeText(img.src); flashSuccess(btn, 'Copied URL'); }
+        catch { flash(btn, 'Failed'); }
+      }
     }
   } else if (act === 'img-open') {
     chrome.tabs.create({ url: img.src });
