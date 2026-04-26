@@ -165,6 +165,56 @@ function scrapePage() {
     });
   });
 
+  // <iframe> video embeds — recognise common providers and synthesise a
+  // canonical "watch" URL + poster image when the provider exposes one.
+  // We push the watch URL (not the embed URL) so copy/open lands on the
+  // viewable page, not the iframe.
+  const EMBEDS = [
+    { name: 'YouTube',     re: /(?:youtube\.com\/embed\/|youtu\.be\/|youtube-nocookie\.com\/embed\/)([\w-]{11})/i,
+      poster: id => `https://img.youtube.com/vi/${id}/hqdefault.jpg`,
+      watch:  id => `https://www.youtube.com/watch?v=${id}` },
+    { name: 'Vimeo',       re: /player\.vimeo\.com\/video\/(\d+)/i,
+      poster: ()  => '',
+      watch:  id => `https://vimeo.com/${id}` },
+    { name: 'Loom',        re: /loom\.com\/embed\/([a-f0-9]+)/i,
+      poster: id => `https://cdn.loom.com/sessions/thumbnails/${id}-with-play.gif`,
+      watch:  id => `https://www.loom.com/share/${id}` },
+    { name: 'Wistia',      re: /(?:fast\.wistia\.net\/embed\/iframe|fast\.wistia\.com\/embed\/medias)\/([a-z0-9]+)/i,
+      poster: ()  => '',
+      watch:  id => `https://wistia.com/medias/${id}` },
+    { name: 'Dailymotion', re: /dailymotion\.com\/embed\/video\/([a-z0-9]+)/i,
+      poster: id => `https://www.dailymotion.com/thumbnail/video/${id}`,
+      watch:  id => `https://www.dailymotion.com/video/${id}` },
+    { name: 'TikTok',      re: /tiktok\.com\/embed\/v?\d?\/?(\d+)/i,
+      poster: ()  => '',
+      watch:  id => `https://www.tiktok.com/embed/${id}` },
+  ];
+
+  document.querySelectorAll('iframe[src]').forEach(f => {
+    const raw = f.getAttribute('src');
+    if (!raw) return;
+    let abs;
+    try { abs = new URL(raw, document.baseURI).href; } catch { return; }
+    for (const p of EMBEDS) {
+      const m = abs.match(p.re);
+      if (!m) continue;
+      const id    = m[1];
+      const watch = p.watch(id);
+      if (seenAsset.has(watch)) break;
+      seenAsset.add(watch);
+      out.images.push({
+        src: watch,
+        alt: (f.title || f.getAttribute('aria-label') || '').trim(),
+        w: f.clientWidth  || 0,
+        h: f.clientHeight || 0,
+        kind: 'embed',
+        poster: p.poster(id),
+        provider: p.name,
+      });
+      break;
+    }
+  });
+
   // JSON-LD schema
   document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
     try {
@@ -428,13 +478,18 @@ function renderImages() {
 
   // ensure each asset has type/name/bytes (kind is set during scrape)
   imgs.forEach(i => {
+    if (!i.kind) i.kind = 'image';
     if (!i.type) {
-      const parsed = parseImgUrl(i.src);
-      i.name = parsed.name;
-      i.type = parsed.type;
+      if (i.kind === 'embed' && i.provider) {
+        i.type = i.provider.toUpperCase();
+        i.name = `${i.provider} video`;
+      } else {
+        const parsed = parseImgUrl(i.src);
+        i.name = parsed.name;
+        i.type = parsed.type;
+      }
       i.bytes = i.bytes || 0;
     }
-    if (!i.kind) i.kind = 'image';
   });
 
   const counts = {};
@@ -448,9 +503,10 @@ function renderImages() {
 
   const visible = state.imgTypes.has('ALL') ? imgs : imgs.filter(i => state.imgTypes.has(i.type));
   const totalBytes = visible.reduce((s, i) => s + (i.bytes || 0), 0);
-  // missing-alt only applies to images, not videos/audio
+  // missing-alt only applies to images, not videos/audio/embeds
   const missing = visible.filter(i => i.kind === 'image' && !i.alt).length;
   const videoCount = visible.filter(i => i.kind === 'video').length;
+  const embedCount = visible.filter(i => i.kind === 'embed').length;
 
   let body = '';
   if (visible.length === 0) {
@@ -478,6 +534,7 @@ function renderImages() {
         <div class="sub">
           <b>${visible.length}</b> of <b>${imgs.length}</b> assets
           ${videoCount ? `<span class="sep">·</span><b>${videoCount}</b> video${videoCount === 1 ? '' : 's'}` : ''}
+          ${embedCount ? `<span class="sep">·</span><b>${embedCount}</b> embed${embedCount === 1 ? '' : 's'}` : ''}
           <span class="sep">·</span>
           <b>${totalBytes ? fmtTotal(totalBytes) : '—'}</b> total
           <span class="sep">·</span>
@@ -519,7 +576,8 @@ function renderImages() {
   $('#viewList').addEventListener('click', () => { state.imgView = 'list'; renderImages(); });
   $('#viewGrid').addEventListener('click', () => { state.imgView = 'grid'; renderImages(); });
   $('#downloadAll').addEventListener('click', () => {
-    visible.filter(i => !i.broken).forEach((img, k) => setTimeout(() => downloadImg(img), k * 150));
+    // skip embeds (would download the iframe HTML, not the video)
+    visible.filter(i => !i.broken && i.kind !== 'embed').forEach((img, k) => setTimeout(() => downloadImg(img), k * 150));
   });
 
   // mark broken thumbs
@@ -565,6 +623,12 @@ function imgThumbHTML(img) {
       : `<video src="${escapeHtml(img.src)}" muted playsinline preload="metadata" referrerpolicy="no-referrer" data-thumb></video>`;
     return `<div class="thumb media">${inner}<span class="play-badge" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span></div>`;
   }
+  if (img.kind === 'embed') {
+    const inner = img.poster
+      ? `<img src="${escapeHtml(img.poster)}" alt="" loading="lazy" referrerpolicy="no-referrer" data-thumb>`
+      : `<div class="provider-tile">${escapeHtml(img.provider || 'Embed')}</div>`;
+    return `<div class="thumb media">${inner}<span class="play-badge" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span></div>`;
+  }
   if (img.kind === 'audio') {
     return `<div class="thumb media audio" aria-hidden="true">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
@@ -573,10 +637,21 @@ function imgThumbHTML(img) {
   return `<div class="thumb"><img src="${escapeHtml(img.src)}" alt="" loading="lazy" referrerpolicy="no-referrer" data-thumb></div>`;
 }
 function imgMetaHTML(img) {
-  const altLine = img.alt
-    ? `<div class="alt" title="${escapeHtml(img.alt)}">${escapeHtml(img.alt)}</div>`
-    : `<div class="alt missing">${ICONS.warn}Missing alt text</div>`;
-  const dims = (img.w && img.h) ? `<span>${img.w}&thinsp;×&thinsp;${img.h}</span><span class="sep"></span>` : '';
+  const isEmbed = img.kind === 'embed';
+  const isMedia = img.kind !== 'image';
+  // alt only meaningful for images; for embeds show iframe title or "Untitled"
+  let altLine;
+  if (isEmbed) {
+    altLine = `<div class="alt">${img.alt ? escapeHtml(img.alt) : '<span class="muted">No iframe title</span>'}</div>`;
+  } else if (isMedia) {
+    altLine = `<div class="alt muted">${img.kind === 'video' ? 'Video file' : 'Audio file'}</div>`;
+  } else if (img.alt) {
+    altLine = `<div class="alt" title="${escapeHtml(img.alt)}">${escapeHtml(img.alt)}</div>`;
+  } else {
+    altLine = `<div class="alt missing">${ICONS.warn}Missing alt text</div>`;
+  }
+  const dims = (img.w && img.h) ? `<span>${img.w}&thinsp;×&thinsp;${img.h}</span>` : '';
+  const sizeCell = isEmbed ? '' : (dims ? `<span class="sep"></span>` : '') + `<span data-size>${fmtSize(img.bytes)}</span>`;
   return `
     <div class="meta">
       <div class="filename" title="${escapeHtml(img.src)}">${escapeHtml(img.name)}</div>
@@ -584,18 +659,21 @@ function imgMetaHTML(img) {
       <div class="specs">
         <span class="tag">${escapeHtml(img.type)}</span>
         ${dims}
-        <span data-size>${fmtSize(img.bytes)}</span>
+        ${sizeCell}
       </div>
     </div>`;
 }
 function imgActionsHTML(idx, variant) {
+  const img = state.data.images[idx];
   const wrap = variant === 'grid' ? 'card-actions' : 'actions';
-  const copy = variant === 'grid' ? '' : `<button class="icon-btn" title="Copy URL" data-act="img-copy" data-i="${idx}" type="button">${ICONS.copy}</button>`;
+  const isEmbed = img && img.kind === 'embed';
+  const copy = variant === 'grid' ? '' : `<button class="icon-btn" title="${isEmbed ? 'Copy watch URL' : 'Copy'}" data-act="img-copy" data-i="${idx}" type="button">${ICONS.copy}</button>`;
+  const dl   = isEmbed ? '' : `<button class="icon-btn primary" title="Download" data-act="img-dl" data-i="${idx}" type="button">${ICONS.download}</button>`;
   return `
     <div class="${wrap}">
       ${copy}
-      <button class="icon-btn" title="Open in new tab" data-act="img-open" data-i="${idx}" type="button">${ICONS.open}</button>
-      <button class="icon-btn primary" title="Download" data-act="img-dl" data-i="${idx}" type="button">${ICONS.download}</button>
+      <button class="icon-btn ${isEmbed ? 'primary' : ''}" title="Open in new tab" data-act="img-open" data-i="${idx}" type="button">${ICONS.open}</button>
+      ${dl}
     </div>`;
 }
 
@@ -609,7 +687,10 @@ function downloadImg(img) {
 
 async function hydrateImageSizes() {
   const imgs = state.data.images;
-  const queue = imgs.filter(i => !i.bytes && !i.src.startsWith('data:'));
+  // skip data:/blob: URIs and iframe embeds (HEAD on an HTML page is noise)
+  const queue = imgs.filter(i =>
+    !i.bytes && !i.src.startsWith('data:') && !i.src.startsWith('blob:') && i.kind !== 'embed'
+  );
   let active = 0;
   const max = 6;
 

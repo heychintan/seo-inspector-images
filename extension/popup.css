@@ -310,6 +310,21 @@ body {
 .thumb.media.audio svg { width: 26px; height: 26px; }
 .card .thumb.media .play-badge svg { width: 36px; height: 36px; }
 
+/* fallback tile for embeds with no poster (Vimeo, Wistia, TikTok, …) */
+.thumb .provider-tile {
+  width: 100%; height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Instrument Serif', serif;
+  font-style: italic;
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  background: var(--accent-2);
+}
+.card .thumb .provider-tile { font-size: 18px; }
+
 .meta { min-width: 0; }
 .filename {
   font-family: 'JetBrains Mono', ui-monospace, monospace;
