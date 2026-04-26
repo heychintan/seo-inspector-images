@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "SEO Inspector — Images",
-  "version": "0.1.0",
-  "description": "List, filter, and download every image on the current page.",
+  "name": "Seofy",
+  "version": "0.2.0",
+  "description": "Inspect a page's SEO surface — overview, headings, links, images, schema, social, and more.",
   "action": {
-    "default_title": "SEO Inspector",
+    "default_title": "Seofy",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon-16.png",

@@ -1,13 +1,16 @@
-// popup.js — runs in the extension popup context
-// Scrapes images from the active tab via chrome.scripting.executeScript,
-// then renders/filters/downloads them locally.
+// Seofy popup — single-page scrape, multi-tab UI.
 
-const $ = sel => document.querySelector(sel);
+const $  = sel => document.querySelector(sel);
+const $$ = sel => [...document.querySelectorAll(sel)];
 
 const state = {
-  images: [],          // [{src, name, type, w, h, bytes, alt, broken?}]
-  types:  new Set(['ALL']),
-  view:   'list',
+  data: null,         // result of scrapePage
+  tab:  'images',     // initial tab (matches aria-current in markup)
+  // images sub-state
+  imgTypes: new Set(['ALL']),
+  imgView:  'list',
+  // links sub-state
+  linkFilter: 'ALL',  // ALL | INTERNAL | EXTERNAL
 };
 
 // ---------- entry ----------
@@ -23,131 +26,172 @@ async function init() {
   try {
     results = await chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: false },
-      func: scrapeImages,
+      func: scrapePage,
     });
   } catch (e) {
     return showError(e.message);
   }
 
-  const raw = results?.[0]?.result || [];
-  state.images = dedupe(raw);
+  state.data = results?.[0]?.result;
+  if (!state.data) return showError('No data returned from page.');
 
   $('#loading').hidden = true;
 
-  if (state.images.length === 0) {
-    $('#none').hidden = false;
-    $('#totalCount').textContent = '0';
-    $('#visibleCount').textContent = '0';
-    $('#totalSize').textContent = '0 KB';
-    $('#missingAlt').textContent = '0';
-    return;
-  }
+  // pre-render all tabs once (cheap), then show the active one
+  renderOverview();
+  renderHeadings();
+  renderLinks();
+  renderImages();
+  renderSchema();
+  renderSocial();
+  renderAdvanced();
 
-  buildChips();
-  bindControls();
-  render();
+  showTab(state.tab);
+  bindNav();
 
-  // Async: HEAD-fetch byte sizes we don't have yet, update rows in place.
-  hydrateSizes();
+  // hydrate image sizes in background
+  hydrateImageSizes();
 }
 
-// ---------- in-page scraper (runs in tab context) ----------
-function scrapeImages() {
-  const out = [];
-  const seen = new Set();
+// ---------- in-page scraper (executes in tab) ----------
+function scrapePage() {
+  const out = {
+    url: location.href,
+    finalUrl: location.href,
+    title:        document.querySelector('title')?.textContent?.trim() || '',
+    description:  document.querySelector('meta[name="description"]')?.content?.trim() || '',
+    canonical:    document.querySelector('link[rel="canonical"]')?.href || '',
+    robots:       document.querySelector('meta[name="robots"]')?.content?.trim() || '',
+    viewport:     document.querySelector('meta[name="viewport"]')?.content?.trim() || '',
+    charset:      document.characterSet || '',
+    lang:         document.documentElement.getAttribute('lang') || '',
+    favicon:      (document.querySelector('link[rel~="icon"]') || {}).href || '',
+    headings: [],
+    links:    [],
+    images:   [],
+    schema:   [],
+    og:       {},
+    twitter:  {},
+    hreflang: [],
+  };
 
-  const push = (src, alt, w, h, source) => {
+  // headings (preserve document order)
+  document.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(h => {
+    out.headings.push({
+      level: Number(h.tagName[1]),
+      text: (h.textContent || '').replace(/\s+/g, ' ').trim(),
+    });
+  });
+
+  // links
+  const origin = location.origin;
+  document.querySelectorAll('a[href]').forEach(a => {
+    const href = a.getAttribute('href');
+    if (!href || href.startsWith('javascript:') || href.startsWith('#')) return;
+    let abs;
+    try { abs = new URL(href, document.baseURI).href; } catch { return; }
+    let internal = false;
+    try { internal = new URL(abs).origin === origin; } catch {}
+    out.links.push({
+      url: abs,
+      anchor: (a.textContent || '').replace(/\s+/g, ' ').trim(),
+      rel: a.getAttribute('rel') || '',
+      target: a.getAttribute('target') || '',
+      internal,
+    });
+  });
+
+  // images (same rules as before but folded in)
+  const seenImg = new Set();
+  const pushImg = (src, alt, w, h) => {
     if (!src) return;
     let abs;
     try { abs = new URL(src, document.baseURI).href; } catch { return; }
     if (!/^https?:|^data:/i.test(abs)) return;
-    if (seen.has(abs)) return;
-    seen.add(abs);
-    out.push({ src: abs, alt: (alt || '').trim(), w: w || 0, h: h || 0, source });
+    if (seenImg.has(abs)) return;
+    seenImg.add(abs);
+    out.images.push({ src: abs, alt: (alt || '').trim(), w: w || 0, h: h || 0 });
   };
-
-  // <img> elements (incl. lazy-loaded variants)
   document.querySelectorAll('img').forEach(img => {
     const src = img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('data-original');
-    push(src, img.alt, img.naturalWidth || img.width, img.naturalHeight || img.height, 'img');
+    pushImg(src, img.alt, img.naturalWidth || img.width, img.naturalHeight || img.height);
   });
-
-  // <picture><source srcset>
   document.querySelectorAll('picture source').forEach(s => {
     const set = s.getAttribute('srcset');
     if (!set) return;
-    set.split(',').forEach(part => {
-      const url = part.trim().split(/\s+/)[0];
-      push(url, '', 0, 0, 'source');
-    });
+    set.split(',').forEach(p => pushImg(p.trim().split(/\s+/)[0], '', 0, 0));
   });
-
-  // SVG <image href>
   document.querySelectorAll('svg image').forEach(im => {
-    const src = im.getAttribute('href') || im.getAttribute('xlink:href');
-    push(src, '', 0, 0, 'svg-image');
+    pushImg(im.getAttribute('href') || im.getAttribute('xlink:href'), '', 0, 0);
   });
-
-  // CSS background-image on visible-ish elements (cap to avoid huge pages)
   let bgScanned = 0;
   for (const el of document.querySelectorAll('*')) {
     if (bgScanned > 600) break;
     bgScanned++;
-    const cs = getComputedStyle(el);
-    const bg = cs.backgroundImage;
+    const bg = getComputedStyle(el).backgroundImage;
     if (!bg || bg === 'none') continue;
     const re = /url\((['"]?)(.*?)\1\)/g;
     let m;
-    while ((m = re.exec(bg)) !== null) push(m[2], '', 0, 0, 'css-bg');
+    while ((m = re.exec(bg)) !== null) pushImg(m[2], '', 0, 0);
   }
+
+  // JSON-LD schema
+  document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+    try {
+      const parsed = JSON.parse(s.textContent || '');
+      out.schema.push(parsed);
+    } catch { /* ignore malformed */ }
+  });
+
+  // og: + twitter: meta
+  document.querySelectorAll('meta[property^="og:"], meta[property^="article:"], meta[property^="profile:"]').forEach(m => {
+    const k = m.getAttribute('property');
+    const v = m.getAttribute('content');
+    if (k && v != null) out.og[k] = v;
+  });
+  document.querySelectorAll('meta[name^="twitter:"]').forEach(m => {
+    const k = m.getAttribute('name');
+    const v = m.getAttribute('content');
+    if (k && v != null) out.twitter[k] = v;
+  });
+
+  // hreflang
+  document.querySelectorAll('link[rel="alternate"][hreflang]').forEach(l => {
+    out.hreflang.push({ lang: l.getAttribute('hreflang'), href: l.href });
+  });
 
   return out;
 }
 
-// ---------- helpers ----------
-function dedupe(items) {
-  const map = new Map();
-  for (const it of items) {
-    const existing = map.get(it.src);
-    if (!existing) {
-      map.set(it.src, enrich(it));
-    } else if (!existing.alt && it.alt) {
-      existing.alt = it.alt;
-    }
-  }
-  return [...map.values()];
+// ---------- nav ----------
+function bindNav() {
+  $('#nav').addEventListener('click', e => {
+    const a = e.target.closest('a[data-tab]');
+    if (!a) return;
+    e.preventDefault();
+    showTab(a.dataset.tab);
+  });
 }
 
-function enrich(it) {
-  const { name, type } = parseUrl(it.src);
-  return { ...it, name, type, bytes: 0, broken: false };
+function showTab(name) {
+  state.tab = name;
+  $$('#nav a').forEach(a => {
+    if (a.dataset.tab === name) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
+  });
+  $$('.tab').forEach(t => { t.hidden = true; });
+  const panel = document.getElementById('tab-' + name);
+  if (panel) panel.hidden = false;
 }
 
-function parseUrl(src) {
-  let name = '';
-  let type = 'OTHER';
-  if (src.startsWith('data:')) {
-    const m = src.match(/^data:image\/([a-z0-9+.-]+)/i);
-    type = (m?.[1] || 'data').toUpperCase().replace('SVG+XML', 'SVG').replace('JPEG', 'JPG');
-    name = `inline.${type.toLowerCase()}`;
-    return { name, type };
-  }
-  try {
-    const u = new URL(src);
-    const path = u.pathname;
-    name = decodeURIComponent(path.split('/').filter(Boolean).pop() || u.hostname);
-    const extMatch = path.match(/\.([a-z0-9]{2,5})(?:$|[?#])/i);
-    if (extMatch) {
-      type = extMatch[1].toUpperCase().replace('JPEG', 'JPG').replace('SVG+XML', 'SVG');
-    } else {
-      // No extension — guess from query or default
-      type = 'IMG';
-    }
-  } catch { /* keep defaults */ }
-  if (!name) name = 'image';
-  return { name, type };
-}
-
+// ---------- shared helpers ----------
+const elt = (tag, cls, html) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (html != null) e.innerHTML = html;
+  return e;
+};
+const escapeHtml = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 const fmtSize = b => {
   if (!b) return '—';
   if (b < 1024) return b + ' B';
@@ -159,78 +203,291 @@ const fmtTotal = b => {
   if (b < 1024 * 1024) return (b / 1024).toFixed(0) + ' KB';
   return (b / (1024 * 1024)).toFixed(1) + ' MB';
 };
-const elt = (tag, cls, html) => {
-  const e = document.createElement(tag);
-  if (cls) e.className = cls;
-  if (html != null) e.innerHTML = html;
-  return e;
+
+const ICONS = {
+  title:    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m4 12 8-9 8 9"/><path d="M12 3v18"/></svg>`,
+  desc:     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>`,
+  link:     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>`,
+  canon:    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/></svg>`,
+  robot:    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>`,
+  globe:    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>`,
+  copy:     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`,
+  open:     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>`,
+  check:    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg>`,
+  warn:     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="9"/></svg>`,
+  download: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>`,
 };
-const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 
-// ---------- chips ----------
-function buildChips() {
-  const counts = {};
-  for (const i of state.images) counts[i.type] = (counts[i.type] || 0) + 1;
-  const types = Object.keys(counts).sort();
+function fieldRow(icon, label, valueHTML, badgeHTML = '') {
+  return `
+    <div class="field">
+      <div class="label"><span class="ico">${icon}</span>${escapeHtml(label)}</div>
+      ${badgeHTML ? badgeHTML : '<span></span>'}
+      <div class="value ${valueHTML ? '' : 'muted'}">${valueHTML || 'Not set'}</div>
+    </div>`;
+}
 
-  const chips = $('#chips');
-  chips.innerHTML = '';
+function lengthBadge(len, ok, soft, msg) {
+  if (len === 0) return `<span class="badge warn">${ICONS.warn} Missing</span>`;
+  if (len <= ok) return `<span class="badge ok">${ICONS.check} ${len} chars</span>`;
+  if (len <= soft) return `<span class="badge info">${len} chars</span>`;
+  return `<span class="badge warn">${ICONS.warn} ${len} chars · ${msg}</span>`;
+}
 
-  const all = elt('button', 'chip', `All <span class="count">${state.images.length}</span>`);
-  all.dataset.type = 'ALL';
-  all.setAttribute('aria-pressed', 'true');
-  all.type = 'button';
-  chips.appendChild(all);
+// =============================================================
+// OVERVIEW
+// =============================================================
+function renderOverview() {
+  const d = state.data;
+  const titleLen = d.title.length;
+  const descLen  = d.description.length;
+  const canonOk  = d.canonical && (d.canonical === d.url || d.canonical === d.finalUrl);
 
-  for (const t of types) {
-    const c = elt('button', 'chip', `<span class="dot"></span>${escapeHtml(t)} <span class="count">${counts[t]}</span>`);
-    c.dataset.type = t;
-    c.setAttribute('aria-pressed', 'false');
-    c.type = 'button';
-    chips.appendChild(c);
+  $('#tab-overview').innerHTML = `
+    <div class="fields">
+      ${fieldRow(ICONS.title, 'Title', escapeHtml(d.title), lengthBadge(titleLen, 60, 70, 'too long'))}
+      ${fieldRow(ICONS.desc,  'Description', escapeHtml(d.description), lengthBadge(descLen, 160, 175, 'too long'))}
+      ${fieldRow(ICONS.link,  'URL', escapeHtml(d.url))}
+      ${fieldRow(ICONS.canon, 'Canonical',
+        d.canonical
+          ? `<a href="${escapeHtml(d.canonical)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">${escapeHtml(d.canonical)}</a>`
+          : '',
+        canonOk
+          ? `<span class="badge ok">${ICONS.check} Self-referencing</span>`
+          : (d.canonical ? `<span class="badge info">External</span>` : `<span class="badge muted">None</span>`)
+      )}
+      ${fieldRow(ICONS.robot, 'Robots', escapeHtml(d.robots) || '<span class="muted">Default (index, follow)</span>',
+        /noindex/i.test(d.robots) ? `<span class="badge warn">${ICONS.warn} noindex</span>` : ''
+      )}
+      ${fieldRow(ICONS.globe, 'Language', escapeHtml(d.lang) || '',
+        d.lang ? `<span class="badge muted">${escapeHtml(d.lang)}</span>` : `<span class="badge warn">${ICONS.warn} No lang attr</span>`
+      )}
+    </div>`;
+}
+
+// =============================================================
+// HEADINGS
+// =============================================================
+function renderHeadings() {
+  const d = state.data;
+  const counts = [0, 0, 0, 0, 0, 0, 0]; // index 0 unused
+  d.headings.forEach(h => counts[h.level]++);
+  const h1Count = counts[1];
+
+  let summary = `<div class="summary">`;
+  for (let i = 1; i <= 6; i++) {
+    const warn = i === 1 && h1Count !== 1;
+    summary += `<div class="stat"><span class="k">${counts[i]}</span><span class="v ${warn ? 'warn' : ''}">H${i}</span></div>`;
+  }
+  summary += `<div class="stat"><span class="k">${d.images.length}</span><span class="v">Images</span></div>`;
+  summary += `<div class="stat"><span class="k">${d.links.length}</span><span class="v">Links</span></div>`;
+  summary += `</div>`;
+
+  let rows = '';
+  if (d.headings.length === 0) {
+    rows = `<div class="empty"><span class="em">No headings.</span>This page has no h1–h6 tags.</div>`;
+  } else {
+    rows = `<div class="headings">`;
+    d.headings.forEach(h => {
+      const indent = Math.max(0, h.level - 1);
+      const empty = !h.text;
+      rows += `<div class="heading lvl-${h.level} ${empty ? 'empty' : ''}" data-indent="${indent}">
+        <span class="tag">H${h.level}</span>
+        <span class="text">${empty ? 'Empty heading' : escapeHtml(h.text)}</span>
+        <span></span>
+      </div>`;
+    });
+    rows += `</div>`;
   }
 
-  chips.addEventListener('click', e => {
-    const btn = e.target.closest('.chip');
-    if (!btn) return;
-    const t = btn.dataset.type;
-    if (t === 'ALL') {
-      state.types = new Set(['ALL']);
-    } else {
-      state.types.delete('ALL');
-      if (state.types.has(t)) state.types.delete(t);
-      else state.types.add(t);
-      if (state.types.size === 0) state.types = new Set(['ALL']);
-    }
-    chips.querySelectorAll('.chip').forEach(c => {
-      c.setAttribute('aria-pressed', state.types.has(c.dataset.type) ? 'true' : 'false');
+  $('#tab-headings').innerHTML = summary + rows;
+}
+
+// =============================================================
+// LINKS
+// =============================================================
+function renderLinks() {
+  const d = state.data;
+  const internal = d.links.filter(l => l.internal);
+  const external = d.links.filter(l => !l.internal);
+  const unique   = new Set(d.links.map(l => l.url)).size;
+
+  const filterChips = `
+    <div class="linkfilter">
+      <button class="chip" data-lf="ALL"      aria-pressed="${state.linkFilter==='ALL'}" type="button">All <span class="count">${d.links.length}</span></button>
+      <button class="chip" data-lf="INTERNAL" aria-pressed="${state.linkFilter==='INTERNAL'}" type="button"><span class="dot"></span>Internal <span class="count">${internal.length}</span></button>
+      <button class="chip" data-lf="EXTERNAL" aria-pressed="${state.linkFilter==='EXTERNAL'}" type="button"><span class="dot"></span>External <span class="count">${external.length}</span></button>
+      <span style="flex:1"></span>
+      <span class="badge muted" style="align-self:center">${unique} unique</span>
+    </div>`;
+
+  const items = state.linkFilter === 'INTERNAL' ? internal
+              : state.linkFilter === 'EXTERNAL' ? external
+              : d.links;
+
+  let body = '';
+  if (items.length === 0) {
+    body = `<div class="empty"><span class="em">No links.</span>Nothing here for this filter.</div>`;
+  } else {
+    body = `<div class="links">`;
+    items.forEach(l => {
+      const tags = [];
+      if (l.rel) l.rel.split(/\s+/).forEach(r => tags.push(`<span class="badge muted">${escapeHtml(r)}</span>`));
+      if (l.target === '_blank') tags.push(`<span class="badge info">_blank</span>`);
+      body += `
+        <div class="linkrow">
+          <span class="anchor ${l.anchor ? '' : 'empty'}">${l.anchor ? escapeHtml(l.anchor) : 'No anchor text'}</span>
+          <span class="meta-tags">${tags.join('')}</span>
+          <span class="url"><a href="${escapeHtml(l.url)}" target="_blank" rel="noopener">${escapeHtml(l.url)}</a></span>
+        </div>`;
     });
-    render();
+    body += `</div>`;
+  }
+
+  $('#tab-links').innerHTML = filterChips + body;
+
+  // bind chip clicks
+  $('#tab-links').querySelectorAll('[data-lf]').forEach(c => {
+    c.addEventListener('click', () => {
+      state.linkFilter = c.dataset.lf;
+      renderLinks();
+    });
   });
 }
 
-// ---------- controls ----------
-function bindControls() {
-  $('#viewList').addEventListener('click', () => setView('list'));
-  $('#viewGrid').addEventListener('click', () => setView('grid'));
-  $('#downloadAll').addEventListener('click', downloadAllVisible);
-  $('#downloadAll').disabled = false;
+// =============================================================
+// IMAGES (existing functionality, ported into the new shell)
+// =============================================================
+function renderImages() {
+  const imgs = state.data.images;
+
+  if (imgs.length === 0) {
+    $('#tab-images').innerHTML = `<div class="empty"><span class="em">No images.</span>This page contains no &lt;img&gt;, picture sources, or CSS background images.</div>`;
+    return;
+  }
+
+  // ensure each image has type/name/bytes
+  imgs.forEach(i => {
+    if (!i.type) {
+      const parsed = parseImgUrl(i.src);
+      i.name = parsed.name;
+      i.type = parsed.type;
+      i.bytes = i.bytes || 0;
+    }
+  });
+
+  const counts = {};
+  for (const i of imgs) counts[i.type] = (counts[i.type] || 0) + 1;
+  const types = Object.keys(counts).sort();
+
+  let chips = `<button class="chip" data-it="ALL" aria-pressed="${state.imgTypes.has('ALL')}" type="button">All <span class="count">${imgs.length}</span></button>`;
+  for (const t of types) {
+    chips += `<button class="chip" data-it="${escapeHtml(t)}" aria-pressed="${state.imgTypes.has(t)}" type="button"><span class="dot"></span>${escapeHtml(t)} <span class="count">${counts[t]}</span></button>`;
+  }
+
+  const visible = state.imgTypes.has('ALL') ? imgs : imgs.filter(i => state.imgTypes.has(i.type));
+  const totalBytes = visible.reduce((s, i) => s + (i.bytes || 0), 0);
+  const missing = visible.filter(i => !i.alt).length;
+
+  let body = '';
+  if (visible.length === 0) {
+    body = `<div class="empty"><span class="em">Nothing matches.</span>Try a different file-type filter.</div>`;
+  } else if (state.imgView === 'list') {
+    body = `<ul class="list">`;
+    visible.forEach(img => {
+      const idx = imgs.indexOf(img);
+      body += `<li class="row" data-i="${idx}">${imgThumbHTML(img)}${imgMetaHTML(img)}${imgActionsHTML(idx, 'list')}</li>`;
+    });
+    body += `</ul>`;
+  } else {
+    body = `<div class="grid">`;
+    visible.forEach(img => {
+      const idx = imgs.indexOf(img);
+      body += `<div class="card" data-i="${idx}">${imgThumbHTML(img)}${imgMetaHTML(img)}${imgActionsHTML(idx, 'grid')}</div>`;
+    });
+    body += `</div>`;
+  }
+
+  $('#tab-images').innerHTML = `
+    <header class="header">
+      <div>
+        <h1>Page <em>imagery</em></h1>
+        <div class="sub">
+          <b>${visible.length}</b> of <b>${imgs.length}</b> images
+          <span class="sep">·</span>
+          <b>${totalBytes ? fmtTotal(totalBytes) : '—'}</b> total
+          <span class="sep">·</span>
+          <b style="color: var(--warn)">${missing}</b> missing alt
+        </div>
+      </div>
+      <button class="download-all" id="downloadAll" type="button" title="Download all visible images">
+        ${ICONS.download} Download all
+      </button>
+    </header>
+    <div class="toolbar" role="toolbar" aria-label="Filter and view options">
+      <div class="chips" id="imgChips" role="group" aria-label="Filter by file type">${chips}</div>
+      <div class="view-toggle" role="group" aria-label="View">
+        <button id="viewList" aria-pressed="${state.imgView==='list'}" aria-label="List" title="List">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="4" cy="6" r="1" fill="currentColor"/><circle cx="4" cy="12" r="1" fill="currentColor"/><circle cx="4" cy="18" r="1" fill="currentColor"/></svg>
+        </button>
+        <button id="viewGrid" aria-pressed="${state.imgView==='grid'}" aria-label="Grid" title="Grid">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        </button>
+      </div>
+    </div>
+    ${body}
+  `;
+
+  // bindings
+  $('#tab-images').querySelectorAll('#imgChips .chip').forEach(c => {
+    c.addEventListener('click', () => {
+      const t = c.dataset.it;
+      if (t === 'ALL') state.imgTypes = new Set(['ALL']);
+      else {
+        state.imgTypes.delete('ALL');
+        if (state.imgTypes.has(t)) state.imgTypes.delete(t);
+        else state.imgTypes.add(t);
+        if (state.imgTypes.size === 0) state.imgTypes = new Set(['ALL']);
+      }
+      renderImages();
+    });
+  });
+  $('#viewList').addEventListener('click', () => { state.imgView = 'list'; renderImages(); });
+  $('#viewGrid').addEventListener('click', () => { state.imgView = 'grid'; renderImages(); });
+  $('#downloadAll').addEventListener('click', () => {
+    visible.filter(i => !i.broken).forEach((img, k) => setTimeout(() => downloadImg(img), k * 150));
+  });
+
+  // mark broken thumbs
+  $('#tab-images').querySelectorAll('[data-thumb]').forEach(el => {
+    el.addEventListener('error', () => {
+      const wrap = el.parentElement;
+      if (!wrap) return;
+      wrap.classList.add('broken');
+      wrap.innerHTML = ICONS.brokenImg || `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11"/><path d="m21 21-6-6"/><path d="m15 21 6-6"/></svg>`;
+      const i = Number(wrap.closest('[data-i]')?.dataset.i);
+      if (imgs[i]) imgs[i].broken = true;
+    }, { once: true });
+  });
 }
 
-function setView(v) {
-  state.view = v;
-  $('#viewList').setAttribute('aria-pressed', v === 'list' ? 'true' : 'false');
-  $('#viewGrid').setAttribute('aria-pressed', v === 'grid' ? 'true' : 'false');
-  render();
+function parseImgUrl(src) {
+  let name = '', type = 'OTHER';
+  if (src.startsWith('data:')) {
+    const m = src.match(/^data:image\/([a-z0-9+.-]+)/i);
+    type = (m?.[1] || 'data').toUpperCase().replace('SVG+XML', 'SVG').replace('JPEG', 'JPG');
+    return { name: `inline.${type.toLowerCase()}`, type };
+  }
+  try {
+    const u = new URL(src);
+    name = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || u.hostname);
+    const m = u.pathname.match(/\.([a-z0-9]{2,5})(?:$|[?#])/i);
+    type = m ? m[1].toUpperCase().replace('JPEG', 'JPG').replace('SVG+XML', 'SVG') : 'IMG';
+  } catch {}
+  return { name: name || 'image', type };
 }
 
-function visibleImages() {
-  if (state.types.has('ALL')) return state.images;
-  return state.images.filter(i => state.types.has(i.type));
-}
-
-// ---------- render ----------
-function thumbHTML(img) {
+function imgThumbHTML(img) {
   if (img.broken) {
     return `<div class="thumb broken" title="Image failed to load">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11"/><path d="m21 21-6-6"/><path d="m15 21 6-6"/></svg>
@@ -238,11 +495,10 @@ function thumbHTML(img) {
   }
   return `<div class="thumb"><img src="${escapeHtml(img.src)}" alt="" loading="lazy" referrerpolicy="no-referrer" data-thumb></div>`;
 }
-
-function metaHTML(img) {
+function imgMetaHTML(img) {
   const altLine = img.alt
     ? `<div class="alt" title="${escapeHtml(img.alt)}">${escapeHtml(img.alt)}</div>`
-    : `<div class="alt missing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="9"/></svg>Missing alt text</div>`;
+    : `<div class="alt missing">${ICONS.warn}Missing alt text</div>`;
   const dims = (img.w && img.h) ? `<span>${img.w}&thinsp;×&thinsp;${img.h}</span><span class="sep"></span>` : '';
   return `
     <div class="meta">
@@ -255,111 +511,63 @@ function metaHTML(img) {
       </div>
     </div>`;
 }
-
-function actionsHTML(idx, variant) {
-  const wrapper = variant === 'grid' ? 'card-actions' : 'actions';
-  const copyBtn = variant === 'grid' ? '' : `
-    <button class="icon-btn" title="Copy URL" data-act="copy" data-i="${idx}" type="button">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-    </button>`;
+function imgActionsHTML(idx, variant) {
+  const wrap = variant === 'grid' ? 'card-actions' : 'actions';
+  const copy = variant === 'grid' ? '' : `<button class="icon-btn" title="Copy URL" data-act="img-copy" data-i="${idx}" type="button">${ICONS.copy}</button>`;
   return `
-    <div class="${wrapper}">
-      ${copyBtn}
-      <button class="icon-btn" title="Open in new tab" data-act="open" data-i="${idx}" type="button">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>
-      </button>
-      <button class="icon-btn primary" title="Download" data-act="dl" data-i="${idx}" type="button">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
-      </button>
+    <div class="${wrap}">
+      ${copy}
+      <button class="icon-btn" title="Open in new tab" data-act="img-open" data-i="${idx}" type="button">${ICONS.open}</button>
+      <button class="icon-btn primary" title="Download" data-act="img-dl" data-i="${idx}" type="button">${ICONS.download}</button>
     </div>`;
 }
 
-function render() {
-  const items = visibleImages();
-  const list = $('#list'), grid = $('#grid'), empty = $('#empty');
-  list.innerHTML = '';
-  grid.innerHTML = '';
-
-  if (items.length === 0) {
-    list.hidden = true;
-    grid.hidden = true;
-    empty.hidden = false;
-  } else {
-    empty.hidden = true;
-    if (state.view === 'list') {
-      list.hidden = false;
-      grid.hidden = true;
-      items.forEach(img => {
-        const idx = state.images.indexOf(img);
-        const li = elt('li', 'row');
-        li.dataset.i = idx;
-        li.innerHTML = thumbHTML(img) + metaHTML(img) + actionsHTML(idx, 'list');
-        list.appendChild(li);
-      });
-    } else {
-      list.hidden = true;
-      grid.hidden = false;
-      items.forEach(img => {
-        const idx = state.images.indexOf(img);
-        const card = elt('div', 'card');
-        card.dataset.i = idx;
-        card.innerHTML = thumbHTML(img) + metaHTML(img) + actionsHTML(idx, 'grid');
-        grid.appendChild(card);
-      });
-    }
-    // mark broken thumbs after they fail to load
-    document.querySelectorAll('[data-thumb]').forEach(el => {
-      el.addEventListener('error', () => {
-        const wrap = el.parentElement;
-        if (!wrap) return;
-        wrap.classList.add('broken');
-        wrap.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11"/><path d="m21 21-6-6"/><path d="m15 21 6-6"/></svg>`;
-        const i = Number(wrap.closest('[data-i]')?.dataset.i);
-        if (state.images[i]) state.images[i].broken = true;
-      }, { once: true });
-    });
-  }
-
-  $('#totalCount').textContent = state.images.length;
-  $('#visibleCount').textContent = items.length;
-  const totalBytes = items.reduce((s, i) => s + (i.bytes || 0), 0);
-  $('#totalSize').textContent = totalBytes ? fmtTotal(totalBytes) : '—';
-  const missing = items.filter(i => !i.alt).length;
-  $('#missingAlt').textContent = missing;
-  $('#missingAlt').style.color = missing ? 'var(--warn)' : 'var(--ok)';
+function downloadImg(img) {
+  chrome.downloads.download({
+    url: img.src,
+    filename: (img.name || 'image').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 180),
+    saveAs: false,
+  }).catch(() => {});
 }
 
-// ---------- size hydration (HEAD requests) ----------
-async function hydrateSizes() {
-  const queue = state.images.filter(i => !i.bytes && !i.src.startsWith('data:'));
-  let active = 0, done = 0;
+async function hydrateImageSizes() {
+  const imgs = state.data.images;
+  const queue = imgs.filter(i => !i.bytes && !i.src.startsWith('data:'));
+  let active = 0;
   const max = 6;
 
   await new Promise(resolve => {
+    if (queue.length === 0) return resolve();
     const next = () => {
       while (active < max && queue.length) {
         const img = queue.shift();
         active++;
-        fetchSize(img.src).then(bytes => {
-          if (bytes != null) {
-            img.bytes = bytes;
-            updateRowSize(img);
+        fetchSize(img.src).then(b => {
+          if (b != null) {
+            img.bytes = b;
+            const node = document.querySelector(`#tab-images [data-i="${imgs.indexOf(img)}"] [data-size]`);
+            if (node) node.textContent = fmtSize(b);
           }
         }).catch(() => {}).finally(() => {
-          active--; done++;
+          active--;
           if (queue.length === 0 && active === 0) resolve();
           else next();
         });
       }
     };
     next();
-    if (queue.length === 0) resolve();
   });
 
-  // refresh totals after hydration
-  const items = visibleImages();
-  const totalBytes = items.reduce((s, i) => s + (i.bytes || 0), 0);
-  $('#totalSize').textContent = totalBytes ? fmtTotal(totalBytes) : '—';
+  // refresh totals if Images tab is currently visible
+  if (state.tab === 'images') {
+    const visible = state.imgTypes.has('ALL') ? imgs : imgs.filter(i => state.imgTypes.has(i.type));
+    const totalBytes = visible.reduce((s, i) => s + (i.bytes || 0), 0);
+    const sub = $('#tab-images .header .sub');
+    if (sub) {
+      const bs = sub.querySelectorAll('b');
+      if (bs[2]) bs[2].textContent = totalBytes ? fmtTotal(totalBytes) : '—';
+    }
+  }
 }
 
 async function fetchSize(url) {
@@ -368,48 +576,160 @@ async function fetchSize(url) {
     if (!r.ok) return null;
     const len = r.headers.get('content-length');
     return len ? Number(len) : null;
-  } catch {
-    return null;
+  } catch { return null; }
+}
+
+// =============================================================
+// SCHEMA
+// =============================================================
+function renderSchema() {
+  const docs = state.data.schema;
+
+  if (docs.length === 0) {
+    $('#tab-schema').innerHTML = `<div class="empty"><span class="em">No structured data.</span>This page has no JSON-LD schema.</div>`;
+    return;
   }
+
+  // flatten @graph entries to top-level docs
+  const flat = [];
+  docs.forEach((d, di) => {
+    if (Array.isArray(d)) d.forEach(item => flat.push({ item, src: `script #${di + 1}` }));
+    else if (d && Array.isArray(d['@graph'])) d['@graph'].forEach(item => flat.push({ item, src: `script #${di + 1} @graph` }));
+    else flat.push({ item: d, src: `script #${di + 1}` });
+  });
+
+  const renderKV = (obj, depth = 0) => {
+    if (obj == null) return '<span>null</span>';
+    if (typeof obj !== 'object') return escapeHtml(String(obj));
+    if (Array.isArray(obj)) {
+      if (obj.length === 0) return '<span>[ ]</span>';
+      if (obj.every(v => typeof v !== 'object')) return escapeHtml(obj.join(', '));
+      return obj.map(v => `<div class="nested">${renderKV(v, depth + 1)}</div>`).join('');
+    }
+    const entries = Object.entries(obj);
+    if (entries.length === 0) return '<span>{ }</span>';
+    return `<div class="kv">` + entries.map(([k, v]) => {
+      const child = (typeof v === 'object' && v !== null)
+        ? `<div class="v"><div class="nested">${renderKV(v, depth + 1)}</div></div>`
+        : `<div class="v">${escapeHtml(String(v))}</div>`;
+      return `<div class="k">${escapeHtml(k)}</div>${child}`;
+    }).join('') + `</div>`;
+  };
+
+  let body = `<div class="schema">`;
+  flat.forEach(({ item, src }) => {
+    const type = item?.['@type'] || 'Untyped';
+    body += `<div class="doc">
+      <div class="doc-head"><span class="type">${escapeHtml(Array.isArray(type) ? type.join(' · ') : String(type))}</span><span class="src">${escapeHtml(src)}</span></div>
+      ${renderKV(item)}
+    </div>`;
+  });
+  body += `</div>`;
+
+  $('#tab-schema').innerHTML = body;
 }
 
-function updateRowSize(img) {
-  const idx = state.images.indexOf(img);
-  if (idx < 0) return;
-  const node = document.querySelector(`[data-i="${idx}"] [data-size]`);
-  if (node) node.textContent = fmtSize(img.bytes);
+// =============================================================
+// SOCIAL
+// =============================================================
+function renderSocial() {
+  const og = state.data.og;
+  const tw = state.data.twitter;
+
+  const ogKeys = Object.keys(og);
+  const twKeys = Object.keys(tw);
+
+  if (ogKeys.length === 0 && twKeys.length === 0) {
+    $('#tab-social').innerHTML = `<div class="empty"><span class="em">No social tags.</span>No Open Graph or Twitter meta tags were found.</div>`;
+    return;
+  }
+
+  const renderGroup = (title, badge, obj) => {
+    const keys = Object.keys(obj);
+    if (keys.length === 0) return '';
+    let html = `<div class="field" style="grid-template-columns:1fr;border-top:1px solid var(--line-2);padding-bottom:6px">
+      <div class="label" style="justify-content:space-between">
+        <span style="display:inline-flex;gap:9px;align-items:center"><span class="ico">${ICONS.globe}</span>${escapeHtml(title)}</span>
+        <span class="badge ${badge}">${keys.length}</span>
+      </div>
+    </div>`;
+    keys.sort().forEach(k => {
+      const v = obj[k];
+      const isUrl = /^https?:\/\//i.test(v);
+      const isImg = /image$/i.test(k) && isUrl;
+      html += `<div class="field" style="grid-template-columns:1fr;padding-top:8px;padding-bottom:8px">
+        <div class="label" style="font-weight:500;font-size:12px;color:var(--muted);font-family:'JetBrains Mono',monospace">${escapeHtml(k)}</div>
+        <div class="value prose" style="grid-column:1;display:flex;gap:10px;align-items:flex-start">
+          ${isImg ? `<img src="${escapeHtml(v)}" alt="" referrerpolicy="no-referrer" loading="lazy" style="width:64px;height:48px;object-fit:cover;border-radius:6px;border:1px solid var(--line);flex-shrink:0">` : ''}
+          <span style="min-width:0;flex:1;word-break:break-word">${isUrl ? `<a href="${escapeHtml(v)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">${escapeHtml(v)}</a>` : escapeHtml(v)}</span>
+        </div>
+      </div>`;
+    });
+    return html;
+  };
+
+  $('#tab-social').innerHTML = `<div class="fields">
+    ${renderGroup('Open Graph', 'info', og)}
+    ${renderGroup('Twitter Card', 'info', tw)}
+  </div>`;
 }
 
-// ---------- actions ----------
+// =============================================================
+// ADVANCED
+// =============================================================
+function renderAdvanced() {
+  const d = state.data;
+
+  let hreflang = '';
+  if (d.hreflang.length) {
+    hreflang = `<div class="value prose">${d.hreflang.map(h => `<div><b style="color:var(--ink);font-weight:600">${escapeHtml(h.lang)}</b> → <a href="${escapeHtml(h.href)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">${escapeHtml(h.href)}</a></div>`).join('')}</div>`;
+  }
+
+  $('#tab-advanced').innerHTML = `
+    <div class="fields">
+      ${fieldRow(ICONS.globe, 'Viewport', escapeHtml(d.viewport), d.viewport ? '' : `<span class="badge warn">${ICONS.warn} Missing</span>`)}
+      ${fieldRow(ICONS.globe, 'Charset', escapeHtml(d.charset))}
+      ${fieldRow(ICONS.globe, 'Favicon', d.favicon ? `<a href="${escapeHtml(d.favicon)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">${escapeHtml(d.favicon)}</a>` : '', d.favicon ? '' : `<span class="badge warn">${ICONS.warn} Missing</span>`)}
+      <div class="field">
+        <div class="label"><span class="ico">${ICONS.globe}</span>Hreflang</div>
+        <span class="badge ${d.hreflang.length ? 'info' : 'muted'}">${d.hreflang.length || 'None'}</span>
+        ${hreflang || '<div class="value muted">No hreflang alternates.</div>'}
+      </div>
+      <div class="field">
+        <div class="label"><span class="ico">${ICONS.link}</span>Robots.txt</div>
+        <a href="${escapeHtml(originOf(d.url))}/robots.txt" target="_blank" rel="noopener" class="copychip" style="background:var(--accent-2);color:var(--accent);padding:5px 10px;border-radius:8px;font-weight:600">${ICONS.open} Open</a>
+      </div>
+      <div class="field">
+        <div class="label"><span class="ico">${ICONS.link}</span>Sitemap.xml</div>
+        <a href="${escapeHtml(originOf(d.url))}/sitemap.xml" target="_blank" rel="noopener" class="copychip" style="background:var(--accent-2);color:var(--accent);padding:5px 10px;border-radius:8px;font-weight:600">${ICONS.open} Open</a>
+      </div>
+    </div>`;
+}
+
+function originOf(url) {
+  try { return new URL(url).origin; } catch { return ''; }
+}
+
+// =============================================================
+// Delegated actions (image actions)
+// =============================================================
 document.addEventListener('click', async e => {
   const btn = e.target.closest('[data-act]');
   if (!btn) return;
-  const img = state.images[Number(btn.dataset.i)];
+  const act = btn.dataset.act;
+  const i = Number(btn.dataset.i);
+  const img = state.data?.images?.[i];
   if (!img) return;
 
-  if (btn.dataset.act === 'copy') {
+  if (act === 'img-copy') {
     try { await navigator.clipboard.writeText(img.src); flash(btn, 'Copied'); }
     catch { flash(btn, 'Failed'); }
-  } else if (btn.dataset.act === 'open') {
+  } else if (act === 'img-open') {
     chrome.tabs.create({ url: img.src });
-  } else if (btn.dataset.act === 'dl') {
-    download(img);
+  } else if (act === 'img-dl') {
+    downloadImg(img);
   }
 });
-
-function download(img) {
-  chrome.downloads.download({ url: img.src, filename: safeFilename(img.name), saveAs: false }).catch(() => {});
-}
-
-function downloadAllVisible() {
-  const items = visibleImages().filter(i => !i.broken);
-  items.forEach((img, k) => setTimeout(() => download(img), k * 150));
-}
-
-function safeFilename(n) {
-  // chrome.downloads disallows path traversal & some chars
-  return n.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 180) || 'image';
-}
 
 function flash(el, msg) {
   const original = el.getAttribute('title');
@@ -418,7 +738,6 @@ function flash(el, msg) {
   setTimeout(() => { el.style.transform = ''; el.setAttribute('title', original || ''); }, 600);
 }
 
-// ---------- error state ----------
 function showError(msg) {
   $('#loading').hidden = true;
   $('#error').hidden = false;

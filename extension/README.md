@@ -1,6 +1,6 @@
-# SEO Inspector — Images (MV3)
+# Seofy (MV3)
 
-Chrome extension popup that lists every image on the active page with filter chips, list/grid views, and one-click downloads.
+Chrome extension that inspects a page's SEO surface — overview, headings, links, images, schema, social tags, and more.
 
 ## Load it
 
